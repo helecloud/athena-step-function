@@ -1,0 +1,255 @@
+# MIT License
+#
+# Copyright (c) 2020 Helecloud
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  athena-step-function-query
+
+  Creates a step function that runs Athena queries without any idling lambdas with configurable retries for error handling. Idea is based on github.com/burtcorp/athena-runner
+
+  In case of error, the query is ran again via [Decorrelated Jitter Algorithm](https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/)
+
+Parameters:
+  InitialWaitTime:
+    Type: Number
+    Default: 30
+    Description: Default InitialWaitTime, see step function input section in readme. Overridable by step function input.
+
+  BaseWaitTime:
+    Type: Number
+    Default: 15
+    Description: Default BaseWaitTime, see step function input section in readme. Overridable by step function input.
+
+  WaitMultiplier:
+    Type: Number
+    Default: 1
+    Description: Default WaitMultiplier, see step function input section in readme. Overridable by step function input.
+
+  MaxWait:
+    Type: Number
+    Default: 450
+    Description: Default MaxWait, see step function input section in readme. Overridable by step function input.
+
+  MaxRetries:
+    Type: Number
+    Default: 10
+    Description: Default MaxRetries, see step function input section in readme. Overridable by step function input.
+
+  RetryStateChangeReasonMatch:
+    Type: String
+    Default: ''
+    Description: Default RetryStateChangeReasonMatch, see step function input section in readme. Overridable by step function input.
+
+  AllowedWorkgroupArns:
+    Type: CommaDelimitedList
+    Default: '*'
+    Description: |-
+      A list of athena workgroups for the step functions to have permission to start queries in. Provide it in ARN format:
+
+      arn:aws:athena:region:account:workgroup/WorkGroupName
+
+  ResultBucketPolicyResource:
+    Type: CommaDelimitedList
+    Default: '*'
+    Description: |-
+      A comma delimited list of S3 buckets and their objects resources to give permission to Athena to write the result in.
+      For example:
+
+      arn:aws:s3:::query-results-custom-bucket,arn:aws:s3:::query-results-custom-bucket/some-path-*
+
+  AllowedGlueActions:
+    Type: CommaDelimitedList
+    Default: 'glue:*'
+    Description: |-
+      A list of allowed actions for Athena to run against Glue. Should contain at least glue:GetPartitions and glue:GetTable
+
+      View this page for more info: https://docs.aws.amazon.com/athena/latest/ug/fine-grained-access-to-glue-resources.html
+
+
+  AllowedGlueResources:
+    Type: CommaDelimitedList
+    Default: '*'
+    Description: |-
+      A list of allowed resources for Athena to access the required Glue tables.
+      It must contain the following ARN types:
+
+      - arn:aws:glue:region:account-id:table/database-name/table-name
+      - arn:aws:glue:region:account-id:database/database-name
+      - arn:aws:glue:region:account-id:catalog
+
+      View this page for more info: https://docs.aws.amazon.com/IAM/latest/UserGuide/list_awsglue.html
+
+Globals:
+  Function:
+    MemorySize: 128
+    Handler: index.handler
+    Runtime: python3.7
+
+Resources:
+  StateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref StartQueryFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref CheckQueryFunction
+      Definition:
+        Comment: "Runs the provided Athena queries without any idling resources waiting for the query to finish."
+        StartAt: StartQuery
+        States:
+          StartQuery:
+            Type: Task
+            Resource: !GetAtt StartQueryFunction.Arn
+            Retry:
+              - ErrorEquals: ["States.ALL"]
+                IntervalSeconds: 15
+                MaxAttempts: 5
+                BackoffRate: 1.5
+            Next: WaitForQuery
+          WaitForQuery:
+            Type: Wait
+            SecondsPath: $.WaitTime
+            Next: CheckQuery
+          CheckQuery:
+            Type: Task
+            Resource: !GetAtt CheckQueryFunction.Arn
+            Retry:
+              - ErrorEquals: ["States.ALL"]
+                IntervalSeconds: 15
+                MaxAttempts: 5
+                BackoffRate: 1.5
+            Next: ProcessResult
+          ProcessResult:
+            Type: Choice
+            Choices:
+              - Variable: $.Decision
+                StringEquals: SUCCEED
+                Next: Success
+              - Variable: $.Decision
+                StringEquals: FAIL
+                Next: Fail
+              - Variable: $.Decision
+                StringEquals: WAIT
+                Next: WaitForQuery
+            Default: StartQuery
+          Success:
+            Type: Succeed
+          Fail:
+            Type: Fail
+
+
+  StartQueryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: 'Calls athena.StartQueryExecution and returns'
+      Environment:
+        Variables:
+          INITIAL_WAIT_TIME: !Ref InitialWaitTime
+      InlineCode: |-
+        import boto3, os
+        def handler(event, context):
+          event['StartQueryExecutionResult'] = boto3.client('athena').start_query_execution(**event['StartQueryParameters'])
+          event['WaitTime'] = event.get('InitialWaitTime', os.getenv('INITIAL_WAIT_TIME'))
+          return event
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: athena:StartQueryExecution
+              Resource: !Ref AllowedWorkgroupArns
+            - Effect: Allow
+              Action: !Ref AllowedGlueActions
+              Resource: !Ref AllowedGlueResources
+            - Effect: Allow
+              Action:
+                - s3:GetBucketLocation
+                - s3:GetObject
+                - s3:ListBucket
+                - s3:ListBucketMultipartUploads
+                - s3:ListMultipartUploadParts
+                - s3:AbortMultipartUpload
+                - s3:PutObject
+              Resource: !Ref ResultBucketPolicyResource
+
+  CheckQueryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: 'Calls athena.getQueryExecution and decides what should be done next depending on config'
+      Environment:
+        Variables:
+          MAX_RETRIES: !Ref MaxRetries
+          MAX_WAIT: !Ref MaxWait
+          RETRY_STATE_CHANGE_REASON_MATCH: !Ref RetryStateChangeReasonMatch
+          BASE_WAIT_TIME: !Ref BaseWaitTime
+          WAIT_MULTIPLIER: !Ref WaitMultiplier
+      InlineCode: |-
+        import boto3, re, random, os, datetime
+        client = boto3.client('athena')
+        default_wait_time = int(os.getenv('BASE_WAIT_TIME'))
+        default_max_wait = int(os.getenv('MAX_WAIT'))
+        def convert_dates(obj):
+          if isinstance(obj, datetime.datetime):
+            return str(obj)
+          elif isinstance(obj, dict):
+            for key in obj:
+              obj[key] = convert_dates(obj[key])
+          return obj
+
+        def handler(event, context):
+          result = client.get_query_execution(QueryExecutionId=event['StartQueryExecutionResult']['QueryExecutionId'])['QueryExecution']
+          event['Result'] = convert_dates(result)
+          state = result['Status']['State']
+          if state == 'SUCCEEDED':
+            event['Decision'] = 'SUCCEED'
+          elif state == 'FAILED':
+            retries = event.get('Retries', 0)
+            error_match = event.get('RetryStateChangeReasonMatch', os.getenv('RETRY_STATE_CHANGE_REASON_MATCH'))
+            max_retries = event.get('MaxRetries', int(os.getenv('MAX_RETRIES')))
+            if re.match(error_match, result['Status']['StateChangeReason']) and retries < max_retries:
+              event['Retries'] = retries + 1
+              max_wait = event.get('MaxWait', default_max_wait)
+              # Decorrelated Jitter from https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/
+              base_wait_time = int(event.get('BaseWaitTime', default_wait_time))
+              maximum_jitter = int(event.get('FailureWaitTime', base_wait_time)) * 3
+              event['FailureWaitTime'] = event['WaitTime'] = min(max_wait, random.randint(base_wait_time, maximum_jitter))
+              event['Decision'] = 'RETRY'
+            else:
+              event['Decision'] = 'FAIL'
+          else:
+            wait_multiplier = event.get('WaitMultiplier', int(os.getenv('WAIT_MULTIPLIER')))
+            new_wait_time = event.get('WaitTime', event.get('BaseWaitTime', default_wait_time)) * wait_multiplier
+            event['WaitTime'] = max(new_wait_time, event.get('MaxWait', default_max_wait))
+            event['Decision'] = 'WAIT'
+          print(event)
+          return event
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: athena:getQueryExecution
+              Resource: !Ref AllowedWorkgroupArns
+
+Outputs:
+  StateMachine:
+    Value: !Ref StateMachine
